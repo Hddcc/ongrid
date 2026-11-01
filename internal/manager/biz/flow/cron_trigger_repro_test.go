@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -24,7 +25,13 @@ func (r *triggerReproRepo) ListEnabled(context.Context) ([]*model.Flow, error) {
 
 type triggerReproRuns struct {
 	*fakeRunRepo
-	done chan *model.FlowRun
+	done    chan *model.FlowRun
+	created int
+}
+
+func (r *triggerReproRuns) CreateRun(context.Context, *model.FlowRun) error {
+	r.created++
+	return nil
 }
 
 func (r *triggerReproRuns) UpdateRun(_ context.Context, run *model.FlowRun) error {
@@ -107,6 +114,52 @@ func TestAlertRunsOnlyMatchingTrigger(t *testing.T) {
 	}
 }
 
+func TestAlertRunsEveryMatchingTriggerInOneRun(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entries string
+	}{
+		{"general first", `{"id":"general-alert","type":"trigger.alert_fired"},{"id":"cpu-alert","type":"trigger.alert_fired","config":{"rule":"cpu"}}`},
+		{"cpu first", `{"id":"cpu-alert","type":"trigger.alert_fired","config":{"rule":"cpu"}},{"id":"general-alert","type":"trigger.alert_fired"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph := fmt.Sprintf(`{
+				"nodes":[%s,
+					{"id":"disk-alert","type":"trigger.alert_fired","config":{"rule":"disk"}},
+					{"id":"general-action","type":"tool","config":{"tool":"general_tool"}},
+					{"id":"cpu-action","type":"tool","config":{"tool":"cpu_tool"}},
+					{"id":"disk-action","type":"tool","config":{"tool":"disk_tool"}},
+					{"id":"shared-action","type":"tool","config":{"tool":"shared_tool"}}
+				],
+				"edges":[
+					{"id":"g1","source":"general-alert","target":"general-action"},
+					{"id":"c1","source":"cpu-alert","target":"cpu-action"},
+					{"id":"d1","source":"disk-alert","target":"disk-action"},
+					{"id":"g2","source":"general-action","target":"shared-action"},
+					{"id":"c2","source":"cpu-action","target":"shared-action"}
+				]}`, tc.entries)
+			tools := &fakeTools{}
+			runs := &triggerReproRuns{fakeRunRepo: &fakeRunRepo{}, done: make(chan *model.FlowRun, 1)}
+			repo := &triggerReproRepo{flow: &model.Flow{ID: 1, GraphJSON: graph, Enabled: true, Version: 1}}
+			uc := NewUsecase(repo, runs, NewEngine(Executors{Tools: tools}, runs, nil), nil)
+
+			NewDispatcher(uc, nil).dispatch(1, "cpu_high", "CPU high", "critical", 0, 0, nil, time.Now())
+			waitTriggerRun(t, runs)
+			if runs.created != 1 {
+				t.Fatalf("created %d runs, want one", runs.created)
+			}
+			tools.mu.Lock()
+			calls := append([]string(nil), tools.calls...)
+			tools.mu.Unlock()
+			sort.Strings(calls)
+			want := []string{"cpu_tool", "general_tool", "shared_tool"}
+			if fmt.Sprint(calls) != fmt.Sprint(want) {
+				t.Fatalf("tool calls = %v, want %v", calls, want)
+			}
+		})
+	}
+}
+
 func TestTriggerEventRejectsRemovedEntryNode(t *testing.T) {
 	repo := &triggerReproRepo{flow: &model.Flow{
 		ID: 1, Enabled: true, GraphJSON: `{"nodes":[{"id":"new-cron","type":"trigger.cron"}]}`,
@@ -118,5 +171,8 @@ func TestTriggerEventRejectsRemovedEntryNode(t *testing.T) {
 	}
 	if _, err := uc.TriggerEvent(t.Context(), 1, NodeTriggerCron, "", nil); err == nil {
 		t.Fatal("event trigger requires a node ID")
+	}
+	if _, err := uc.TriggerEvents(t.Context(), 1, NodeTriggerCron, []string{"new-cron", "removed-cron"}, nil); err == nil {
+		t.Fatal("all selected trigger nodes must still exist before creating a run")
 	}
 }

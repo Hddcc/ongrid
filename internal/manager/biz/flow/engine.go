@@ -67,13 +67,13 @@ type runState struct {
 // Execute runs the graph to completion and returns the terminal run
 // status. It is synchronous — the usecase calls it from a goroutine.
 //
-// entryType scopes the trigger type; entryNodeID selects one matching
-// trigger for an event. An empty node ID preserves manual-run behavior.
-func (e *Engine) Execute(ctx context.Context, run *model.FlowRun, g *Graph, entryType, entryNodeID string) (status string, runErr error) {
+// entryType scopes the trigger type; entryNodeIDs select matching event
+// entries in one run. No selected IDs preserves manual-run behavior.
+func (e *Engine) Execute(ctx context.Context, run *model.FlowRun, g *Graph, entryType string, entryNodeIDs ...string) (status string, runErr error) {
 	ctx, span := flowTracer.Start(ctx, "flow.Engine.Execute",
 		trace.WithAttributes(
 			attribute.String("flow.entry_type", entryTypeLabel(entryType)),
-			attribute.String("flow.entry_node_id", entryNodeID),
+			attribute.StringSlice("flow.entry_node_ids", entryNodeIDs),
 		),
 	)
 	defer func() {
@@ -90,16 +90,22 @@ func (e *Engine) Execute(ctx context.Context, run *model.FlowRun, g *Graph, entr
 
 	all := g.Triggers()
 	triggers := all[:0:0]
+	selected := make(map[string]bool, len(entryNodeIDs))
+	for _, id := range entryNodeIDs {
+		if id != "" {
+			selected[id] = true
+		}
+	}
 	for _, t := range all {
-		if (entryType == "" || t.Type == entryType) && (entryNodeID == "" || t.ID == entryNodeID) {
+		if (entryType == "" || t.Type == entryType) && (len(selected) == 0 || selected[t.ID]) {
 			triggers = append(triggers, t)
 		}
 	}
 	if len(triggers) == 0 {
-		if entryNodeID == "" {
+		if len(selected) == 0 {
 			return model.RunStatusFailed, fmt.Errorf("graph has no %s trigger node", entryTypeLabel(entryType))
 		}
-		return model.RunStatusFailed, fmt.Errorf("graph has no %s trigger node %q", entryTypeLabel(entryType), entryNodeID)
+		return model.RunStatusFailed, fmt.Errorf("graph has no selected %s trigger node", entryTypeLabel(entryType))
 	}
 
 	var trigger map[string]any
